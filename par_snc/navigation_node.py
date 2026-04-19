@@ -350,7 +350,9 @@ class NavigationNode(Node):
                 self.state = "exploring_frontiers"
 
         else:
-            self.get_logger().warn(f"Nav2 goal failed with status={status}")
+            self.get_logger().warn(
+                f"Nav2 goal failed with status={status} ({self.goal_status_to_text(status)})"
+            )
             if self.current_goal_xy is not None:
                 self.add_failed_frontier(self.current_goal_xy[0], self.current_goal_xy[1])
 
@@ -363,6 +365,22 @@ class NavigationNode(Node):
         self.current_result_future = None
         self.current_goal_xy = None
         self.goal_start_time = None
+
+    @staticmethod
+    def goal_status_to_text(status):
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            return 'SUCCEEDED'
+        if status == GoalStatus.STATUS_ABORTED:
+            return 'ABORTED'
+        if status == GoalStatus.STATUS_CANCELED:
+            return 'CANCELED'
+        if status == GoalStatus.STATUS_ACCEPTED:
+            return 'ACCEPTED'
+        if status == GoalStatus.STATUS_EXECUTING:
+            return 'EXECUTING'
+        if status == GoalStatus.STATUS_CANCELING:
+            return 'CANCELING'
+        return 'UNKNOWN'
 
     def cancel_current_goal(self):
         try:

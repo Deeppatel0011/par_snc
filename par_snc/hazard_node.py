@@ -54,6 +54,9 @@ class HazardNode(Node):
 
         self.hazard_pub = self.create_publisher(Marker, HAZARD_TOPIC, 10)
 
+        # Real object detections from find_object_2d pipeline.
+        self.create_subscription(String, '/hazard_detections', self.detected_object_callback, 10)
+
         # For now, manual testing:
         # ros2 topic pub /test_detected_object std_msgs/msg/String "{data: 'explosive'}" --once
         self.create_subscription(String, '/test_detected_object', self.test_detected_object_callback, 10)
@@ -202,6 +205,10 @@ class HazardNode(Node):
         }
 
         self.publish_hazard_marker(hazard_key, hazard_x, hazard_y, 0.20)
+
+    def detected_object_callback(self, msg):
+        self.get_logger().info(f"Detected object received: {msg.data}")
+        self.handle_detected_object(msg.data)
 
     def test_detected_object_callback(self, msg):
         self.get_logger().info(f"Manual test object received: {msg.data}")

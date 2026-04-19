@@ -38,6 +38,7 @@ class PathTrackerReturnHome(Node):
         self.declare_parameter('debug_log_paths', False)
         self.declare_parameter('debug_log_every_n', 1)
         self.declare_parameter('navigate_to_pose_topic', '/navigate_to_pose')
+        self.declare_parameter('enable_return_action', False)
 
         self.map_frame = self.get_parameter('map_frame').value
         self.base_frame = self.get_parameter('base_frame').value
@@ -53,6 +54,7 @@ class PathTrackerReturnHome(Node):
         self.debug_log_paths = bool(self.get_parameter('debug_log_paths').value)
         self.debug_log_every_n = max(1, int(self.get_parameter('debug_log_every_n').value))
         self.navigate_to_pose_topic = self.get_parameter('navigate_to_pose_topic').value
+        self.enable_return_action = bool(self.get_parameter('enable_return_action').value)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -78,7 +80,9 @@ class PathTrackerReturnHome(Node):
         self.explore_publish_count = 0
         self.return_publish_count = 0
 
-        self.action_client = ActionClient(self, NavigateToPose, self.navigate_to_pose_topic)
+        self.action_client = None
+        if self.enable_return_action:
+            self.action_client = ActionClient(self, NavigateToPose, self.navigate_to_pose_topic)
         self.active_goal_handle = None
 
         self.timer = self.create_timer(self.sample_period, self._track_robot_pose)
@@ -100,6 +104,10 @@ class PathTrackerReturnHome(Node):
         self.get_logger().info('Received /trigger_start. Exploration path tracking started.')
 
     def _on_return_home(self, _msg):
+        if not self.enable_return_action:
+            self.get_logger().info('Return-home action replay disabled (enable_return_action=false).')
+            return
+
         if self.return_active:
             self.get_logger().warn('Return-home already active. Ignoring duplicate trigger.')
             return
@@ -155,9 +163,8 @@ class PathTrackerReturnHome(Node):
             self._on_start(None)
             return
 
-        if 'returning home' in status and not self.return_active:
-            self.get_logger().info('Status indicates return-home started. Replaying reverse path.')
-            self._on_return_home(None)
+        # Do not auto-start return-home from status text, as another node may own
+        # NavigateToPose goals. Use /trigger_home explicitly when desired.
 
     def _track_robot_pose(self):
         if not self.exploration_started and not self.return_active:
@@ -249,6 +256,11 @@ class PathTrackerReturnHome(Node):
 
     def _send_next_waypoint_goal(self):
         if not self.return_active:
+            return
+
+        if self.action_client is None:
+            self.get_logger().error('Action client not available; enable_return_action is false.')
+            self.return_active = False
             return
 
         if self.return_waypoint_index >= len(self.return_waypoints):
