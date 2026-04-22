@@ -23,7 +23,8 @@ setup(
     entry_points={
         'console_scripts': [
             'navigation_node = par_snc.navigation_node:main',
-            'hazard_node = par_snc.hazard_node:main',
+            'hazard_detector = par_snc.hazard_detector:main',
+            'hazard_detection_node = par_snc.hazard_detection:main',
             'path_node = par_snc.path_node:main',
         ],
     },
