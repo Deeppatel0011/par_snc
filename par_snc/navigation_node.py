@@ -4,134 +4,159 @@ import math
 from collections import deque
 
 import rclpy
-from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.node import Node
 from action_msgs.msg import GoalStatus
 
 from std_msgs.msg import String, Empty
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from nav2_msgs.action import NavigateToPose
 
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 
-from par_snc.common import STATUS_TOPIC
+from par_snc.common import (
+    HAZARD_INSPECT_TOPIC,
+    PATH_EXPLORE_TOPIC,
+    STATUS_TOPIC,
+    TRIGGER_HOME_TOPIC,
+    TRIGGER_START_TOPIC,
+    TRIGGER_TELEOP_TOPIC,
+)
 
 
 class NavigationNode(Node):
     def __init__(self):
         super().__init__('navigation_node')
 
-        # -----------------------------
-        # Publishers
-        # -----------------------------
         self.status_pub = self.create_publisher(String, STATUS_TOPIC, 10)
         self.cmd_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
 
-        # -----------------------------
-        # Subscribers
-        # -----------------------------
-        self.create_subscription(Empty, '/trigger_start', self.start_callback, 10)
-        self.create_subscription(Empty, '/trigger_home', self.home_callback, 10)
-        self.create_subscription(Empty, '/trigger_teleop', self.teleop_callback, 10)
+        self.create_subscription(Empty, TRIGGER_START_TOPIC, self.start_callback, 10)
+        self.create_subscription(Empty, TRIGGER_HOME_TOPIC, self.home_callback, 10)
+        self.create_subscription(Empty, TRIGGER_TELEOP_TOPIC, self.teleop_callback, 10)
+        self.create_subscription(Empty, HAZARD_INSPECT_TOPIC, self.hazard_inspect_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
+        self.create_subscription(Path, PATH_EXPLORE_TOPIC, self.explore_path_callback, 10)
 
-        # -----------------------------
-        # Nav2 action client
-        # -----------------------------
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # -----------------------------
-        # TF
-        # -----------------------------
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # -----------------------------
-        # State
-        # -----------------------------
         self.state = "waiting_for_start"
         self.map_msg = None
         self.home_pose = None
         self.start_received = False
         self.exploration_complete = False
 
-        # Goal / frontier handling
         self.current_goal_handle = None
         self.current_goal_future = None
         self.current_result_future = None
         self.current_goal_xy = None
         self.goal_start_time = None
-        self.goal_timeout_sec = 55.0
+        self.goal_timeout_sec = 70.0
 
-        # Frontier memory
-        self.failed_frontiers = []       # list of (x, y, time_sec, fail_count)
-        self.visited_frontiers = []      # list of (x, y, time_sec)
+        self.failed_frontiers = []
+        self.visited_frontiers = []
 
         self.last_frontier_retry_time = 0.0
-        self.frontier_retry_wait_sec = 2.0
+        self.frontier_retry_wait_sec = 1.0
 
-        # Recovery
+        self.no_frontier_count = 0
+        self.no_frontier_limit = 4
+
         self.recovery_mode = False
         self.recovery_end_time = None
         self.recovery_phase = "none"
         self.recovery_turn_direction = 1.0
 
-        # Laser distances
         self.front_distance = None
         self.front_left_distance = None
         self.front_right_distance = None
         self.left_distance = None
         self.right_distance = None
 
-        # -----------------------------
-        # Tuning - relaxed for maze
-        # -----------------------------
-        self.safe_front_distance = 0.70
+        self.safe_front_distance = 0.60
         self.emergency_front_distance = 0.32
-        self.side_safe_distance = 0.30
+        self.side_safe_distance = 0.25
 
         self.recovery_back_speed = -0.07
         self.recovery_turn_speed = 0.7
 
-        # Frontier settings
         self.min_frontier_cluster_size = 5
-        self.frontier_blacklist_radius = 0.28
-        self.frontier_visited_radius = 0.35
-        self.frontier_goal_tolerance = 0.45
+        self.frontier_blacklist_radius = 0.15
+        self.frontier_visited_radius = 0.20
         self.min_frontier_distance_from_robot = 0.35
-        self.max_fail_count_per_region = 3
+        self.max_fail_count_per_region = 5
 
-        # Timers
+        self.raw_explore_points = []
+        self.return_waypoints = []
+        self.return_waypoint_index = 0
+        self.return_waypoint_spacing = 0.35
+        self.following_return_path = False
+
+        self.initial_scan_active = False
+        self.initial_scan_start_time = None
+        self.initial_scan_duration = 4.0
+        self.initial_scan_angular_speed = 0.7
+
+        self.inspect_active = False
+        self.inspect_start_time = None
+        self.inspect_duration = 3.0
+        self.inspect_angular_speed = 0.7
+        self.last_inspect_request_time = -999.0
+        self.inspect_cooldown_sec = 2.0
+
         self.control_timer = self.create_timer(0.2, self.control_loop)
         self.status_timer = self.create_timer(1.0, self.publish_status)
 
-        self.get_logger().info("Navigation Node Started - Improved Frontier Exploration")
+        self.get_logger().info("Navigation Node Started - Stable Frontier Exploration")
 
-    # =========================================================
-    # Trigger callbacks
-    # =========================================================
     def start_callback(self, msg):
         if self.state == "teleoperation":
             return
 
         self.start_received = True
         self.exploration_complete = False
+        self.no_frontier_count = 0
+        self.following_return_path = False
+        self.return_waypoint_index = 0
+        self.return_waypoints = []
 
         pose = self.get_robot_pose()
         if pose is not None and self.home_pose is None:
             self.home_pose = self.make_pose_stamped(pose[0], pose[1], pose[2], frame_id="map")
             self.get_logger().info(f"Saved home pose at x={pose[0]:.2f}, y={pose[1]:.2f}")
 
-        self.state = "exploring_frontiers"
-        self.get_logger().info("START TRIGGER RECEIVED -> exploring_frontiers")
+        self.cancel_current_goal()
+        self.stop_robot()
+
+        self.initial_scan_active = True
+        self.initial_scan_start_time = self.now_sec()
+        self.inspect_active = False
+        self.state = "initial_scan"
+
+        self.get_logger().info("START TRIGGER RECEIVED -> initial start scan")
 
     def home_callback(self, msg):
         self.cancel_current_goal()
         self.stop_robot()
         self.recovery_mode = False
+        self.initial_scan_active = False
+        self.inspect_active = False
+
+        self.prepare_return_waypoints()
+
+        if self.return_waypoints:
+            self.following_return_path = True
+            self.return_waypoint_index = 0
+            self.state = "returning_home"
+            self.send_next_return_waypoint()
+            self.get_logger().info("RETURN HOME TRIGGER RECEIVED -> following reversed explore path")
+            return
 
         if self.home_pose is None:
             pose = self.get_robot_pose()
@@ -141,8 +166,9 @@ class NavigationNode(Node):
         if self.home_pose is not None:
             sent = self.send_pose_goal(self.home_pose)
             if sent:
+                self.following_return_path = False
                 self.state = "returning_home"
-                self.get_logger().info("RETURN HOME TRIGGER RECEIVED -> returning_home")
+                self.get_logger().warn("Return path unavailable -> fallback to direct home pose")
             else:
                 self.state = "waiting_for_start"
                 self.get_logger().warn("Could not send home goal")
@@ -154,12 +180,109 @@ class NavigationNode(Node):
         self.cancel_current_goal()
         self.stop_robot()
         self.recovery_mode = False
+        self.initial_scan_active = False
+        self.inspect_active = False
+        self.following_return_path = False
         self.state = "teleoperation"
         self.get_logger().info("TELEOP TRIGGER RECEIVED -> teleoperation")
 
-    # =========================================================
-    # Sensor callbacks
-    # =========================================================
+    def hazard_inspect_callback(self, msg):
+        now = self.now_sec()
+
+        if self.state not in ["exploring_frontiers", "navigating_to_frontier"]:
+            return
+
+        if self.initial_scan_active or self.inspect_active or self.following_return_path:
+            return
+
+        if now - self.last_inspect_request_time < self.inspect_cooldown_sec:
+            return
+
+        self.last_inspect_request_time = now
+
+        self.cancel_current_goal()
+        self.stop_robot()
+
+        self.inspect_active = True
+        self.inspect_start_time = now
+        self.state = "inspecting_hazards"
+
+        self.get_logger().info("New hazard placed -> short inspection spin")
+
+    def explore_path_callback(self, msg: Path):
+        self.raw_explore_points = []
+        for pose in msg.poses:
+            self.raw_explore_points.append((
+                float(pose.pose.position.x),
+                float(pose.pose.position.y)
+            ))
+
+    def prepare_return_waypoints(self):
+        if not self.raw_explore_points:
+            self.return_waypoints = []
+            return
+
+        sampled = []
+        last_kept = None
+
+        for point in self.raw_explore_points:
+            if last_kept is None:
+                sampled.append(point)
+                last_kept = point
+                continue
+
+            dist = math.hypot(point[0] - last_kept[0], point[1] - last_kept[1])
+            if dist >= self.return_waypoint_spacing:
+                sampled.append(point)
+                last_kept = point
+
+        if sampled[-1] != self.raw_explore_points[-1]:
+            sampled.append(self.raw_explore_points[-1])
+
+        reversed_points = list(reversed(sampled))
+
+        if self.home_pose is not None:
+            home_xy = (
+                float(self.home_pose.pose.position.x),
+                float(self.home_pose.pose.position.y)
+            )
+            if not reversed_points or math.hypot(
+                reversed_points[-1][0] - home_xy[0],
+                reversed_points[-1][1] - home_xy[1]
+            ) > 0.10:
+                reversed_points.append(home_xy)
+
+        robot_pose = self.get_robot_pose()
+        if robot_pose is not None and reversed_points:
+            if math.hypot(reversed_points[0][0] - robot_pose[0], reversed_points[0][1] - robot_pose[1]) < 0.20:
+                reversed_points = reversed_points[1:]
+
+        self.return_waypoints = reversed_points
+
+    def send_next_return_waypoint(self):
+        if self.return_waypoint_index >= len(self.return_waypoints):
+            self.following_return_path = False
+            self.state = "finished"
+            self.stop_robot()
+            self.get_logger().info("Completed reversed return path")
+            return
+
+        wx, wy = self.return_waypoints[self.return_waypoint_index]
+        robot_pose = self.get_robot_pose()
+        yaw = robot_pose[2] if robot_pose is not None else 0.0
+        pose = self.make_pose_stamped(wx, wy, yaw, frame_id="map")
+
+        if self.send_pose_goal(pose):
+            self.state = "returning_home"
+            self.get_logger().info(
+                f"Return waypoint {self.return_waypoint_index + 1}/{len(self.return_waypoints)} -> x={wx:.2f}, y={wy:.2f}"
+            )
+        else:
+            self.get_logger().warn("Failed to send return waypoint")
+            self.state = "finished"
+            self.following_return_path = False
+            self.stop_robot()
+
     def scan_callback(self, msg):
         ranges = list(msg.ranges)
         if not ranges:
@@ -188,13 +311,16 @@ class NavigationNode(Node):
     def map_callback(self, msg):
         self.map_msg = msg
 
-    # =========================================================
-    # Status
-    # =========================================================
     def get_status_text(self):
         if self.state == "teleoperation":
             return "Teleoperation Mode"
+        if self.state == "initial_scan":
+            return "Initial Scan For Hazard Markers"
+        if self.state == "inspecting_hazards":
+            return "Inspecting For Hazard Markers"
         if self.state == "returning_home":
+            if self.following_return_path:
+                return "Returning Home - Reverse Path"
             return "Returning Home"
         if self.state == "finished":
             return "Finished"
@@ -215,9 +341,6 @@ class NavigationNode(Node):
         msg.data = self.get_status_text()
         self.status_pub.publish(msg)
 
-    # =========================================================
-    # Utility: cmd_vel
-    # =========================================================
     def publish_cmd(self, linear_x, angular_z):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -229,15 +352,9 @@ class NavigationNode(Node):
     def stop_robot(self):
         self.publish_cmd(0.0, 0.0)
 
-    # =========================================================
-    # Utility: time
-    # =========================================================
     def now_sec(self):
         return self.get_clock().now().nanoseconds / 1e9
 
-    # =========================================================
-    # Utility: TF pose
-    # =========================================================
     def get_robot_pose(self):
         try:
             transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
@@ -280,9 +397,6 @@ class NavigationNode(Node):
         pose.pose.orientation.w = qw
         return pose
 
-    # =========================================================
-    # Nav2 helpers
-    # =========================================================
     def send_pose_goal(self, pose_stamped):
         if not self.nav_to_pose_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn("NavigateToPose action server not available")
@@ -317,8 +431,12 @@ class NavigationNode(Node):
             self.get_logger().warn("Goal rejected by Nav2")
             self.current_goal_handle = None
             self.current_result_future = None
-            if self.current_goal_xy is not None:
+
+            if self.current_goal_xy is not None and self.state != "returning_home":
                 self.add_failed_frontier(self.current_goal_xy[0], self.current_goal_xy[1])
+            elif self.following_return_path:
+                self.return_waypoint_index += 1
+                self.send_next_return_waypoint()
             return
 
         self.current_goal_handle = goal_handle
@@ -330,8 +448,13 @@ class NavigationNode(Node):
             result = future.result()
         except Exception as e:
             self.get_logger().warn(f"Goal result error: {e}")
-            if self.current_goal_xy is not None:
+            if self.current_goal_xy is not None and self.state != "returning_home":
                 self.add_failed_frontier(self.current_goal_xy[0], self.current_goal_xy[1])
+
+            if self.following_return_path:
+                self.return_waypoint_index += 1
+                self.send_next_return_waypoint()
+
             self.current_goal_handle = None
             self.current_result_future = None
             return
@@ -340,6 +463,16 @@ class NavigationNode(Node):
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info("Nav2 goal succeeded")
+
+            if self.following_return_path:
+                self.return_waypoint_index += 1
+                self.current_goal_handle = None
+                self.current_result_future = None
+                self.current_goal_xy = None
+                self.goal_start_time = None
+                self.send_next_return_waypoint()
+                return
+
             if self.current_goal_xy is not None:
                 self.add_visited_frontier(self.current_goal_xy[0], self.current_goal_xy[1])
 
@@ -350,9 +483,17 @@ class NavigationNode(Node):
                 self.state = "exploring_frontiers"
 
         else:
-            self.get_logger().warn(
-                f"Nav2 goal failed with status={status} ({self.goal_status_to_text(status)})"
-            )
+            self.get_logger().warn(f"Nav2 goal failed with status={status}")
+
+            if self.following_return_path:
+                self.return_waypoint_index += 1
+                self.current_goal_handle = None
+                self.current_result_future = None
+                self.current_goal_xy = None
+                self.goal_start_time = None
+                self.send_next_return_waypoint()
+                return
+
             if self.current_goal_xy is not None:
                 self.add_failed_frontier(self.current_goal_xy[0], self.current_goal_xy[1])
 
@@ -365,22 +506,6 @@ class NavigationNode(Node):
         self.current_result_future = None
         self.current_goal_xy = None
         self.goal_start_time = None
-
-    @staticmethod
-    def goal_status_to_text(status):
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            return 'SUCCEEDED'
-        if status == GoalStatus.STATUS_ABORTED:
-            return 'ABORTED'
-        if status == GoalStatus.STATUS_CANCELED:
-            return 'CANCELED'
-        if status == GoalStatus.STATUS_ACCEPTED:
-            return 'ACCEPTED'
-        if status == GoalStatus.STATUS_EXECUTING:
-            return 'EXECUTING'
-        if status == GoalStatus.STATUS_CANCELING:
-            return 'CANCELING'
-        return 'UNKNOWN'
 
     def cancel_current_goal(self):
         try:
@@ -395,9 +520,6 @@ class NavigationNode(Node):
         self.current_goal_xy = None
         self.goal_start_time = None
 
-    # =========================================================
-    # Recovery
-    # =========================================================
     def start_recovery(self, turn_left=True):
         self.cancel_current_goal()
 
@@ -431,15 +553,12 @@ class NavigationNode(Node):
             self.recovery_phase = "none"
             self.stop_robot()
 
-            if self.state not in ["returning_home", "teleoperation"]:
+            if self.state not in ["returning_home", "teleoperation", "initial_scan", "inspecting_hazards"]:
                 self.state = "exploring_frontiers"
             return False
 
         return False
 
-    # =========================================================
-    # Frontier memory
-    # =========================================================
     def add_failed_frontier(self, x, y):
         now = self.now_sec()
 
@@ -455,9 +574,8 @@ class NavigationNode(Node):
 
     def is_near_failed_frontier(self, x, y):
         for fx, fy, _, count in self.failed_frontiers:
-            if math.hypot(x - fx, y - fy) < self.frontier_blacklist_radius:
-                if count >= self.max_fail_count_per_region:
-                    return True
+            if math.hypot(x - fx, y - fy) < self.frontier_blacklist_radius and count >= self.max_fail_count_per_region:
+                return True
         return False
 
     def is_near_visited_frontier(self, x, y):
@@ -466,9 +584,6 @@ class NavigationNode(Node):
                 return True
         return False
 
-    # =========================================================
-    # Map / frontier helpers
-    # =========================================================
     def map_index(self, mx, my, width):
         return my * width + mx
 
@@ -574,7 +689,7 @@ class NavigationNode(Node):
 
             candidate_cells = sorted(
                 cluster,
-                key=lambda c: (c[0] - avg_mx) ** 2 + (c[1] - avg_my) ** 2
+                key=lambda c: (c[0] - avg_mx) * 2 + (c[1] - avg_my) * 2
             )
 
             chosen = None
@@ -598,14 +713,8 @@ class NavigationNode(Node):
             if self.is_near_visited_frontier(wx, wy):
                 continue
 
-            # Better scoring:
-            # prefer larger clusters and meaningful exploration distance
-            # but avoid extremely far useless targets
             cluster_size = len(cluster)
             score = (2.5 * cluster_size) + (1.2 * dist_to_robot)
-
-            if dist_to_robot > 5.5:
-                score -= 3.0
 
             if score > best_score:
                 best_score = score
@@ -613,12 +722,35 @@ class NavigationNode(Node):
 
         return best_goal
 
-    # =========================================================
-    # Main control loop
-    # =========================================================
     def control_loop(self):
         if self.state in ["waiting_for_start", "teleoperation", "finished"]:
             return
+
+        if self.state == "initial_scan":
+            if self.initial_scan_active:
+                elapsed = self.now_sec() - self.initial_scan_start_time
+                if elapsed < self.initial_scan_duration:
+                    self.publish_cmd(0.0, self.initial_scan_angular_speed)
+                    return
+                else:
+                    self.stop_robot()
+                    self.initial_scan_active = False
+                    self.state = "exploring_frontiers"
+                    self.get_logger().info("Initial scan complete -> exploring_frontiers")
+                    return
+
+        if self.state == "inspecting_hazards":
+            if self.inspect_active:
+                elapsed = self.now_sec() - self.inspect_start_time
+                if elapsed < self.inspect_duration:
+                    self.publish_cmd(0.0, self.inspect_angular_speed)
+                    return
+                else:
+                    self.stop_robot()
+                    self.inspect_active = False
+                    self.state = "exploring_frontiers"
+                    self.get_logger().info("Inspection scan complete -> exploring_frontiers")
+                    return
 
         if self.front_distance is not None and self.front_distance < self.emergency_front_distance:
             if not self.recovery_mode:
@@ -636,10 +768,15 @@ class NavigationNode(Node):
         if self.state == "returning_home":
             if self.goal_start_time is not None:
                 if (self.now_sec() - self.goal_start_time) > self.goal_timeout_sec:
-                    self.get_logger().warn("Home goal timeout")
+                    self.get_logger().warn("Return goal timeout")
                     self.cancel_current_goal()
-                    self.state = "finished"
-                    self.stop_robot()
+
+                    if self.following_return_path:
+                        self.return_waypoint_index += 1
+                        self.send_next_return_waypoint()
+                    else:
+                        self.state = "finished"
+                        self.stop_robot()
             return
 
         if self.map_msg is None:
@@ -656,7 +793,6 @@ class NavigationNode(Node):
                     self.state = "exploring_frontiers"
                     return
 
-            # only recover if really squeezed
             side_too_close = False
             if self.front_left_distance is not None and self.front_left_distance < self.side_safe_distance:
                 side_too_close = True
@@ -682,20 +818,20 @@ class NavigationNode(Node):
             frontier_goal = self.get_frontier_goal()
 
             if frontier_goal is None:
-                self.get_logger().info("No more valid frontiers found -> exploration complete")
-                self.exploration_complete = True
+                self.no_frontier_count += 1
+                self.get_logger().warn(
+                    f"No valid frontier this cycle ({self.no_frontier_count}/{self.no_frontier_limit})"
+                )
 
-                if self.home_pose is not None:
-                    sent = self.send_pose_goal(self.home_pose)
-                    if sent:
-                        self.state = "returning_home"
-                    else:
-                        self.state = "finished"
-                        self.stop_robot()
-                else:
-                    self.state = "finished"
-                    self.stop_robot()
+                if self.no_frontier_count < self.no_frontier_limit:
+                    return
+
+                self.get_logger().info("No more valid frontiers found repeatedly -> exploration complete")
+                self.exploration_complete = True
+                self.home_callback(Empty())
                 return
+
+            self.no_frontier_count = 0
 
             fx, fy, fyaw = frontier_goal
             pose = self.make_pose_stamped(fx, fy, fyaw, frame_id="map")
@@ -707,13 +843,11 @@ class NavigationNode(Node):
                 self.add_failed_frontier(fx, fy)
                 self.state = "exploring_frontiers"
 
-    # =========================================================
-    # Shutdown
-    # =========================================================
     def destroy_node(self):
         try:
             self.cancel_current_goal()
-            self.stop_robot()
+            if rclpy.ok():
+                self.stop_robot()
         except Exception:
             pass
         super().destroy_node()
@@ -728,9 +862,22 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_robot()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                node.stop_robot()
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

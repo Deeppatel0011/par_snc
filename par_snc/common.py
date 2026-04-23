@@ -36,3 +36,9 @@ STATUS_TOPIC = "/snc_status"
 HAZARD_TOPIC = "/hazards"
 PATH_EXPLORE_TOPIC = "/path_explore"
 PATH_RETURN_TOPIC = "/path_return"
+
+TRIGGER_START_TOPIC = "/trigger_start"
+TRIGGER_HOME_TOPIC = "/trigger_home"
+TRIGGER_TELEOP_TOPIC = "/trigger_teleop"
+
+HAZARD_INSPECT_TOPIC = "/hazard_inspect_request"

@@ -5,6 +5,11 @@ from std_msgs.msg import Float32MultiArray, String
 class HazardDetector(Node):
     def __init__(self):
         super().__init__('hazard_detector_bridge')
+
+        self.declare_parameter('object_id_offset', 0)
+        self.declare_parameter('start_marker_id', 12)
+        self.object_id_offset = int(self.get_parameter('object_id_offset').value)
+        self.start_marker_id = int(self.get_parameter('start_marker_id').value)
         
         # Subscribes to the raw math data from find_object_2d
         self.subscription = self.create_subscription(
@@ -40,22 +45,33 @@ class HazardDetector(Node):
         # find_object_2d sends an array. The first number is the Object ID.
         if len(msg.data) > 0:
             obj_id = int(msg.data[0])
+
+            if obj_id == self.start_marker_id:
+                return
+
+            translated_id = obj_id
+            if translated_id not in self.hazard_map:
+                translated_id = obj_id - self.object_id_offset
             
             # Look up the ID in our assignment dictionary
-            if obj_id in self.hazard_map:
-                hazard_name = self.hazard_map[obj_id]
+            if translated_id in self.hazard_map:
+                hazard_name = self.hazard_map[translated_id]
                 
                 # Format: "ID,Name,CenterPixelX,CenterPixelY"
                 # We use 320, 240 as default image centers for calculation
-                detection_str = f"{obj_id},{hazard_name},320,240"
+                detection_str = f"{translated_id},{hazard_name},320,240"
                 
                 output_msg = String()
                 output_msg.data = detection_str
                 
                 self.publisher.publish(output_msg)
-                self.get_logger().info(f"DETECTED: ID {obj_id} is {hazard_name}")
+                self.get_logger().info(
+                    f"DETECTED: object_id={obj_id} mapped_id={translated_id} hazard={hazard_name}"
+                )
             else:
-                self.get_logger().warn(f"Detected ID {obj_id}, but it's not in the assignment list!")
+                self.get_logger().warn(
+                    f"Detected object ID {obj_id}, but mapped ID {translated_id} is unknown"
+                )
 
 def main(args=None):
     rclpy.init(args=args)

@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -18,7 +19,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'objects_path',
-            default_value='/home/user/aiil_workspace/humble_workspace/src/par_coursework/par_snc/objects',
+            default_value='~/aiil_workspace/humble_workspace/src/par_coursework/objects_example',
             description='Path to trained hazard marker images'
         ),
 
@@ -26,6 +27,18 @@ def generate_launch_description():
             'find_object_gui',
             default_value='false',
             description='Open find_object_2d GUI'
+        ),
+
+        DeclareLaunchArgument(
+            'enable_hazard_detector',
+            default_value='true',
+            description='Start hazard_detector bridge node'
+        ),
+
+        DeclareLaunchArgument(
+            'enable_hazard_detection',
+            default_value='true',
+            description='Start hazard_detection_node mapper node'
         ),
 
         IncludeLaunchDescription(
@@ -47,14 +60,16 @@ def generate_launch_description():
             package='par_snc',
             executable='hazard_detector',
             name='hazard_detector_bridge',
-            output='screen'
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('enable_hazard_detector'))
         ),
 
         Node(
             package='par_snc',
             executable='hazard_detection_node',
             name='hazard_detection_node',
-            output='screen'
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('enable_hazard_detection'))
         ),
 
         Node(
