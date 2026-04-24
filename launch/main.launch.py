@@ -19,7 +19,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'objects_path',
-            default_value='~/aiil_workspace/humble_workspace/src/par_coursework/objects_example',
+            default_value='/ros2_ws/src/par_coursework/objects_example',
             description='Path to trained hazard marker images'
         ),
 
